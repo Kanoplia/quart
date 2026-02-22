@@ -10,9 +10,9 @@ class BotConfig:
     chat_ids: list[int]
 
 config = BotConfig(
-        token="8391779709:AAGiKML1NEVLD-MuSBXsCRj5szW9DwxsXbo",  # Вместо os.getenv("BOT_TOKEN")
+        token="8391779709:AAGiKML1NEVLD-MuSBXsCRj5szW9DwxsXbo", 
         base_url="http://127.0.0.1:8000",
-        admin_ids=[1167279221],  # Укажите реальные ID администраторов
+        admin_ids=[1167279221,1599926314],  
         chat_ids=[-1003484286449,-1003456437345]  # Укажите ID чатов, где работает бот
    
     )

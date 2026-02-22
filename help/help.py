@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup
-from config import config, support_chat_id  # Импортируем из вашего config.py
+from config import config, support_chat_id  
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import sqlite3 
@@ -294,9 +294,11 @@ async def handle_support_response(message: Message, bot):
 async def handle_user_message(message: Message, bot):
     """Обработка новых сообщений от пользователя"""
     # Игнорируем служебные сообщения и команды
-    if message.text and message.text.lower() in ["обратная связь", "обжалование"]:
+    if message.text and message.text.lower() in ["обратная связь", "обжалование","идеи и предложения","правила"]:
         return
-    
+    if message.text and message.text.startswith('/'):
+        return
+
     # Проверяем, есть ли у пользователя активный тикет
     try:
         conn = sqlite3.connect('my_database.db')
@@ -377,7 +379,7 @@ async def handle_user_message(message: Message, bot):
 
 @router_help.callback_query(F.data.startswith("close_ticket_"))
 async def close_ticket(callback_query: CallbackQuery, bot):
-    """Закрытие тикета администратором"""
+    """Закрытие тикета администратором с добавлением кнопки удаления топика"""
     # Проверка прав администратора
     if callback_query.from_user.id not in ADMIN_USER_IDS:
         await callback_query.answer("CloseOperation", show_alert=True)
@@ -421,13 +423,21 @@ async def close_ticket(callback_query: CallbackQuery, bot):
         except Exception as e:
             logger.error(f"Error notifying user {user_id} about closed ticket: {e}")
         
-        # Редактируем сообщение с кнопкой
+        # === ДОБАВЛЕНИЕ КНОПКИ УДАЛЕНИЯ ТОПИКА ===
+        delete_button = InlineKeyboardButton(
+            text="🗑️ Удалить топик",
+            callback_data=f"delete_topic_{ticket_id}"
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[delete_button]])
+        # ======================================
+        
+        # Редактируем сообщение с КНОПКОЙ УДАЛЕНИЯ
         try:
             await bot.edit_message_text(
                 chat_id=SUPPORT_CHAT_ID,
                 message_id=callback_query.message.message_id,
                 text=f"CloseOperation\nТикет #{ticket_id} ({tag}) был закрыт администратором {callback_query.from_user.full_name}.",
-                reply_markup=None
+                reply_markup=markup  # Теперь с кнопкой удаления
             )
             
             # Добавляем уведомление в топик
@@ -444,6 +454,56 @@ async def close_ticket(callback_query: CallbackQuery, bot):
     except Exception as e:
         logger.error(f"Error closing ticket: {e}")
         await callback_query.answer("CloseOperation", show_alert=True)
+        
+
+@router_help.callback_query(F.data.startswith("delete_topic_"))
+async def delete_topic(callback_query: CallbackQuery, bot):
+    """Удаление топика после закрытия тикета"""
+    if callback_query.from_user.id not in ADMIN_USER_IDS:
+        await callback_query.answer("Недостаточно прав", show_alert=True)
+        return
+    
+    try:
+        ticket_id = int(callback_query.data.split("_")[2])
+        
+        # Получаем topic_id из БД
+        conn = sqlite3.connect('my_database.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT topic_id FROM Tickets WHERE id = ?", (ticket_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result or not result[0]:
+            await callback_query.answer("Топик не найден", show_alert=True)
+            return
+        
+        topic_id = result[0]
+        
+        # 1. Отправляем сообщение В КОНЕЦ топика
+        await bot.send_message(
+            chat_id=SUPPORT_CHAT_ID,
+            message_thread_id=topic_id,
+            text="🗑️ **Топик будет удален**\n\nВсе данные архивированы. Тема больше не будет принимать сообщения."
+        )
+        
+        # 2. Закрываем форумную тему (аналог "удаления")
+        await bot.close_forum_topic(
+            chat_id=SUPPORT_CHAT_ID,
+            message_thread_id=topic_id
+        )
+        
+        # 3. Убираем кнопку из основного сообщения
+        await bot.edit_message_reply_markup(
+            chat_id=SUPPORT_CHAT_ID,
+            message_id=callback_query.message.message_id,
+            reply_markup=None
+        )
+        
+        await callback_query.answer(f"Топик #{ticket_id} удален и заархивирован")
+        
+    except Exception as e:
+        logger.error(f"Error deleting topic: {e}")
+        await callback_query.answer("Ошибка при удалении топика", show_alert=True)
 
 # ================ ОБРАБОТЧИК УДАЛЕНИЯ ТИКЕТОВ ================
 
