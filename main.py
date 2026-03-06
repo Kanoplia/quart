@@ -2,6 +2,9 @@ import asyncio
 from config import BOT_TOKEN
 from bot import get_bot, setup_dispatcher
 from database.storage import init_db  
+from web import keep_alive
+
+keep_alive()
 
 async def main():
     if not init_db():
