@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup
-from config import config, support_chat_id  
+from config import config
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 import sqlite3 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 router_help = Router()
 ADMIN_USER_IDS = config.admin_ids
-SUPPORT_CHAT_ID = support_chat_id
+SUPPORT_CHAT_ID = config.support_chat_id
 
 def is_private_chat(message: Message) -> bool:
     return message.chat.type == "private"
@@ -102,15 +102,17 @@ async def get_complaint_text(message: Message, state: FSMContext, bot):
     user_id = message.from_user.id
     
     await state.update_data(complaint_text=complaint_text)
+    if complaint_text not in config.commands:
+        keyboard = InlineKeyboardBuilder()
+        keyboard.add(
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_{user_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_{user_id}")
+        )
     
-    keyboard = InlineKeyboardBuilder()
-    keyboard.add(
-        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_{user_id}"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_{user_id}")
-    )
-    
-    await message.answer(f"Вы написали:\n{complaint_text}\n\nПодтвердите отправку:", reply_markup=keyboard.as_markup())
-    await state.set_state(ComplaintStates.waiting_for_confirmation)
+        await message.answer(f"Вы написали:\n{complaint_text}\n\nПодтвердите отправку:", reply_markup=keyboard.as_markup())
+        await state.set_state(ComplaintStates.waiting_for_confirmation)
+    else:
+        await message.answer(f'это команда бездарь')
 
 @router_help.callback_query(F.data.startswith("confirm_"))
 async def confirm_complaint(callback_query: CallbackQuery, state: FSMContext, bot):
@@ -228,7 +230,8 @@ async def handle_support_response(message: Message, bot):
     # Игнорируем сообщения не из топиков
     if not message.message_thread_id:
         return
-    
+    if type(message.text)==type(None):
+        return
     # Находим пользователя по ID топика
     try:
         conn = sqlite3.connect('my_database.db')
@@ -263,7 +266,6 @@ async def handle_support_response(message: Message, bot):
         except Exception as e:
             logger.error(f"Error sending closed ticket warning: {e}")
         return
-    
     # Пересылаем ответ пользователю
     try:
         # Если сообщение содержит медиа
@@ -294,7 +296,7 @@ async def handle_support_response(message: Message, bot):
 async def handle_user_message(message: Message, bot):
     """Обработка новых сообщений от пользователя"""
     # Игнорируем служебные сообщения и команды
-    if message.text and message.text.lower() in ["обратная связь", "обжалование","идеи и предложения","правила"]:
+    if message.text and message.text.lower() in config.commands:
         return
     if message.text and message.text.startswith('/'):
         return
