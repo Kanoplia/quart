@@ -4,6 +4,7 @@
 __pycache__/
 *.o
 *.obj
+my_database.db
 
 # Dependencies
 .venv/

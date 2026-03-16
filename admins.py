@@ -32,7 +32,7 @@ async def get_username_by_id(user_id: int) -> str:
         return f"ID: {user_id}"
     
 async def display_results(session_id: int):
-    conn = sqlite3.connect('admins.db')
+    conn = sqlite3.connect(config.db)
     cursor = conn.cursor()
 
     try:
@@ -96,7 +96,7 @@ async def display_results(session_id: int):
 # Функция для получения всех админов из чата и сохранения в базу
 async def save_all_current_admins(chat_id):
     logger.info(f"Начинаем обновление админов для чата {chat_id}")
-    conn = sqlite3.connect('admins.db')
+    conn = sqlite3.connect(config.db)
     cursor = conn.cursor()
     
     try:
@@ -145,7 +145,7 @@ async def cmd_admin_list(message: types.Message):
     if message.chat.id != adm_chat_id:
         logger.info("Команда /admin вызвана не в админ чате, игнорируем")
         return
-    conn = sqlite3.connect('admins.db')
+    conn = sqlite3.connect(config.db)
     cursor = conn.cursor()
     
     try:
@@ -201,7 +201,7 @@ async def cmd_create_voting(message: types.Message):
         end_datetime = start_datetime + timedelta(hours=duration_hours)
 
         # Получаем список админов
-        conn = sqlite3.connect('admins.db')
+        conn = sqlite3.connect(config.db)
         cursor = conn.cursor()
         cursor.execute('SELECT user_id, role_name FROM admins WHERE chat_id = ?', (adm_chat_id,))
         admins = cursor.fetchall()
@@ -248,7 +248,7 @@ async def cmd_create_voting(message: types.Message):
             await message.answer("Нет подходящих кандидатов для голосования.")
             return
 
-        conn = sqlite3.connect('admins.db')
+        conn = sqlite3.connect(config.db)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO voting_sessions 
@@ -278,7 +278,7 @@ async def cmd_create_voting(message: types.Message):
             await asyncio.sleep(max(0, time_to_wait))
 
             # Переподключаемся к БД
-            conn = sqlite3.connect('admins.db')
+            conn = sqlite3.connect(config.db)
             cursor = conn.cursor()
             cursor.execute('SELECT roles_config FROM voting_sessions WHERE id = ?', (session_id,))
             row = cursor.fetchone()
@@ -320,7 +320,7 @@ async def cmd_create_voting(message: types.Message):
                 await message.bot.pin_chat_message(chat_id=message.chat.id, message_id=voting_message.message_id)
 
                 # Обновляем статус
-                conn = sqlite3.connect('admins.db')
+                conn = sqlite3.connect(config.db)
                 cursor = conn.cursor()
                 cursor.execute('UPDATE voting_sessions SET status = ? WHERE id = ?', ('active', session_id))
                 conn.commit()
@@ -338,7 +338,7 @@ async def cmd_create_voting(message: types.Message):
             await asyncio.sleep(max(0, time_to_wait))
 
             # Обновляем статус
-            conn = sqlite3.connect('admins.db')
+            conn = sqlite3.connect(config.db)
             cursor = conn.cursor()
             cursor.execute('UPDATE voting_sessions SET status = ? WHERE id = ?', ('finished', session_id))
             conn.commit()
@@ -372,7 +372,7 @@ async def cmd_create_voting(message: types.Message):
 # Заглушка для функции display_results
 async def display_results(session_id: int):
     try:
-        conn = sqlite3.connect('admins.db')
+        conn = sqlite3.connect(config.db)
         cursor = conn.cursor()
         cursor.execute('SELECT vote_data FROM votes WHERE session_id = ?', (session_id,))
         votes = cursor.fetchall()
@@ -398,7 +398,7 @@ async def cmd_delete_voting(message: types.Message):
         session_id = int(args[0])
         
         # Удаляем сессию голосования и связанные голоса
-        conn = sqlite3.connect('admins.db')
+        conn = sqlite3.connect(config.db)
         cursor = conn.cursor()
         
         # Удаляем голоса, связанные с сессией
