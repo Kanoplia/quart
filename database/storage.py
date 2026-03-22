@@ -39,8 +39,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER,
                 voter_id INTEGER,
-                candidate_id INTEGER,
-                role_type TEXT,
+                voter_role TEXT,
                 FOREIGN KEY (session_id) REFERENCES voting_sessions (id)
             )
         ''')

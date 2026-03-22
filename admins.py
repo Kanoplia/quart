@@ -1,14 +1,15 @@
 from aiogram import Bot, types, Router, F
 from aiogram.filters import Command
-import sqlite3
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import CallbackQuery,InlineKeyboardMarkup, InlineKeyboardButton
+import sqlite3
 from config import config
 import logging
 from datetime import datetime, timedelta
 import asyncio
 import json
 import pytz
-
+import re
 
 
 # Настройка логирования
@@ -21,6 +22,7 @@ router_adm = Router()
 
 adm_chat_id = config.adm_chat_id
 
+USER_CACHE = {}
 
 async def get_username_by_id(user_id: int) -> str:
     try:
@@ -263,7 +265,7 @@ async def start_voting_task(session_id: int, bot):
     roles_config = json.loads(roles_config_json)
 
     # Ждём нужного времени
-    delay = (start_dt - get_msk_now()).total_seconds()
+    delay = (start_dt - datetime.now(pytz.timezone('Europe/Moscow'))).total_seconds()
     await asyncio.sleep(max(0, delay))
 
     keyboard_builder = InlineKeyboardBuilder()
@@ -318,7 +320,7 @@ async def end_voting_task(session_id: int, bot):
     end_dt = datetime.fromisoformat(end_time_str)
     conn.close()
 
-    delay = (end_dt - get_msk_now()).total_seconds()
+    delay = (end_dt - datetime.now(pytz.timezone('Europe/Moscow'))).total_seconds()
     await asyncio.sleep(max(0, delay))
 
     # Открепление сообщения
@@ -399,11 +401,178 @@ async def cmd_create_voting(message: types.Message):
         logger.error(f"Ошибка при создании голосования: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
 
-    
-# Заглушка для функции display_results
-async def display_results(session_id: int):
-    return 
 
+def escape_md(text: str) -> str:
+    if not text:
+        return ""
+    for ch in '_*[]()~`>#+-=|{}.!':
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+async def get_cached_user_info(user_id: int):
+    """Получает информацию о пользователе, кэшируя её."""
+    if user_id in USER_CACHE:
+        return USER_CACHE[user_id]
+
+    try:
+        user = await bot.get_chat(user_id)
+        USER_CACHE[user_id] = {"full_name": user.full_name, "username": user.username}
+        return USER_CACHE[user_id]
+    except Exception:
+        return None
+
+@router_adm.callback_query(F.data.startswith("select_role_"))
+async def handle_select_role_callback(callback: CallbackQuery):
+    parts = callback.data.split("_", 2)
+    if len(parts) != 3:
+        await callback.answer("Неверные данные.")
+        return
+
+    promotion_path = {
+        "Око Совета": "Клинок Совета",
+        "Клинок Совета": "Дозор Совета",
+        "Дозор Совета": "Тень Совета",
+        "Премия": "Премия"
+    }
+
+    role_key = parts[2].replace('_', ' ')
+    if role_key not in promotion_path:
+        await callback.answer("Неизвестная роль.")
+        return
+
+    role_name = promotion_path[role_key]
+    chat_id = callback.message.chat.id
+
+    conn = None
+    try:
+        conn = sqlite3.connect(config.db)
+        cursor = conn.cursor()
+
+        if role_name != "Премия":
+            cursor.execute('''
+                SELECT user_id FROM admins WHERE chat_id = ? AND role_name = ?
+            ''', (chat_id, role_name))
+            admin_records = cursor.fetchall()
+        else:
+            cursor.execute('''SELECT user_id FROM admins WHERE chat_id = ?''', (chat_id,))
+            admin_records = cursor.fetchall()
+
+            # Фильтрация ботов
+            filtered_admins = []
+            for (user_id,) in admin_records:
+                try:
+                    chat = await bot.get_chat(user_id)
+                    username = chat.username
+                    if username and username.lower().endswith('bot'):
+                        continue
+                    else:
+                        filtered_admins.append((user_id,))
+                except Exception:
+                    pass
+            admin_records = filtered_admins
+
+        keyboard = InlineKeyboardBuilder()
+
+        if not admin_records:
+            text = f"🚫 Нет администраторов с ролью *{escape_md(role_name)}*."
+        else:
+            async def fetch_user_info(user_id_tuple):
+                user_id = user_id_tuple[0]
+                try:
+                    user_info = await get_cached_user_info(user_id)
+                    if user_info:
+                        full_name = escape_md(user_info["full_name"])
+                        username = user_info["username"]
+                        display_name = f"@{escape_md(username)}" if username else full_name
+                        return user_id, display_name
+                    else:
+                        return user_id, f"Пользователь [ID: {user_id}]"
+                except Exception:
+                    return user_id, f"Пользователь [ID: {user_id}]"
+
+            results = await asyncio.gather(*[fetch_user_info(record) for record in admin_records])
+
+            # Добавляем кнопки для каждого админа
+            for user_id, display_name in results:
+                # Пример callback_data: admin_profile_123456789
+                button = InlineKeyboardButton(
+                    text=display_name,
+                    callback_data=f"admin_profile_{user_id}"
+                )
+                keyboard.add(button)
+
+            # Кнопка "Назад" — одна под всеми
+            back_button = InlineKeyboardButton(text="⬅️ Назад", callback_data="show_admin_roles")
+            keyboard.add(back_button)
+            keyboard.adjust(1)  # Каждая кнопка — в отдельной строке
+
+            escaped_role_name = escape_md(role_name)
+            text = f"👥 *Выберите администратора из роли «{escaped_role_name}»:*"
+
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="MarkdownV2"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Ошибка при отображении админов по роли: {e}")
+        await callback.answer("Произошла ошибка.", show_alert=True)
+    finally:
+        if conn:
+            conn.close()
+
+@router_adm.callback_query(F.data == "show_admin_roles")
+async def show_voting_roles(callback: CallbackQuery):
+    # Получаем активную сессию голосования
+    conn = sqlite3.connect(config.db)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT roles_config, end_time FROM voting_sessions 
+        WHERE status = 'active' AND message_id = ?
+    ''', (callback.message.message_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        await callback.answer("❌ Голосование завершено или не найдено.")
+        await callback.message.delete()
+        conn.close()
+        return
+
+    roles_config_json, end_time_str = row
+    roles_config = json.loads(roles_config_json)
+    end_dt = datetime.fromisoformat(end_time_str)
+
+    conn.close()
+
+    
+    keyboard_builder = InlineKeyboardBuilder()
+    for role_name in roles_config.keys():
+        callback_data = f"select_role_{role_name.replace(' ', '_')}"
+        keyboard_builder.button(
+            text=f"Голосовать за {role_name}",
+            callback_data=callback_data
+        )
+    keyboard_builder.adjust(1)
+    
+
+    keyboard = keyboard_builder.as_markup()
+
+    try:
+        await callback.message.edit_text(
+            text=(
+                f"✅ <b>Голосование активно!</b>\n\n"
+                f"🔚 Завершение: <b>{end_dt.strftime('%H:%M %d.%m.%Y')}</b>\n\n"
+                "Выберите роль, за которую хотите проголосовать:"
+            ),
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Не удалось обновить меню: {e}")
+        await callback.answer("Ошибка при возврате к меню.")
         
 # Команда для удаления голосования
 @router_adm.message(Command('del_voting'))
