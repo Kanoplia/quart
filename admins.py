@@ -1,13 +1,15 @@
-from aiogram import Bot, Dispatcher, types, Router
+from aiogram import Bot, types, Router, F
 from aiogram.filters import Command
 import sqlite3
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config
 import logging
 from datetime import datetime, timedelta
 import asyncio
 import json
+import pytz
+
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,6 +20,7 @@ bot = Bot(token=config.token)
 router_adm = Router()
 
 adm_chat_id = config.adm_chat_id
+
 
 async def get_username_by_id(user_id: int) -> str:
     try:
@@ -171,6 +174,178 @@ async def cmd_admin_list(message: types.Message):
     
     await message.answer(response)
 
+
+async def validate_and_calculate_times(time_str: str, duration_hours: int):
+    try:
+        now = datetime.now(pytz.timezone('Europe/Moscow'))
+        hour, minute = map(int, time_str.split(':'))
+        start_datetime = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if start_datetime <= now:
+            start_datetime += timedelta(days=1)
+        end_datetime = start_datetime + timedelta(hours=duration_hours)
+        return start_datetime, end_datetime
+    except ValueError:
+        return None, None
+    
+    
+async def build_roles_configuration(chat_id: int):
+    conn = sqlite3.connect(config.db)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, role_name FROM admins WHERE chat_id = ?', (chat_id,))
+    admins = cursor.fetchall()
+    conn.close()
+
+    if not admins:
+        return {}
+
+    role_hierarchy = ["Око Совета", "Клинок Совета", "Дозор Совета", "Тень Совета"]
+    promotion_path = {
+        "Око Совета": "Клинок Совета",
+        "Клинок Совета": "Дозор Совета",
+        "Дозор Совета": "Тень Совета"
+    }
+
+    admin_roles = {uid: role for uid, role in admins}
+    roles_config = {}
+
+    for target_role, required_role in promotion_path.items():
+        candidates = [uid for uid, current_role in admin_roles.items() if current_role == required_role]
+        roles_config[target_role] = candidates
+
+    all_admin_ids = [uid for uid, _ in admins]
+    roles_config["Премия"] = all_admin_ids
+
+    return {role: candidates for role, candidates in roles_config.items() if candidates}
+
+
+async def create_voting_session(target_time: str, duration: int, start_dt, end_dt, roles_config: dict):
+    try:
+        conn = sqlite3.connect(config.db)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO voting_sessions 
+            (session_type, target_date, duration_hours, start_time, end_time, status, roles_config, message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            "role_assignment",
+            target_time,
+            duration,
+            start_dt,
+            end_dt,
+            "pending",
+            json.dumps(roles_config),
+            None
+        ))
+        session_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return session_id
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении сессии в БД: {e}")
+        return None
+    
+    
+async def start_voting_task(session_id: int, bot):
+    # Получаем данные сессии
+    conn = sqlite3.connect(config.db)
+    cursor = conn.cursor()
+    cursor.execute('SELECT start_time, end_time, duration_hours, roles_config FROM voting_sessions WHERE id = ?', (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        logger.error("Сессия голосования не найдена при старте")
+        return
+
+    start_time, end_time, duration, roles_config_json = row
+    start_dt = datetime.fromisoformat(start_time)
+    end_dt = datetime.fromisoformat(end_time)
+    roles_config = json.loads(roles_config_json)
+
+    # Ждём нужного времени
+    delay = (start_dt - get_msk_now()).total_seconds()
+    await asyncio.sleep(max(0, delay))
+
+    keyboard_builder = InlineKeyboardBuilder()
+    for role_name in roles_config.keys():
+        callback_data = f"select_role_{role_name.replace(' ', '_')}"
+        keyboard_builder.button(
+            text=f"Голосовать за {role_name}",
+            callback_data=callback_data
+        )
+    keyboard_builder.adjust(1)
+    keyboard = keyboard_builder.as_markup()
+
+    try:
+        voting_message = await bot.send_message(
+            chat_id=adm_chat_id,
+            text=(
+                f"✅ <b>Голосование началось!</b>\n\n"
+                f"🕒 Начало: <b>{start_dt.strftime('%H:%M %d.%m.%Y')}</b>\n"
+                f"🔚 Завершение: <b>{end_dt.strftime('%H:%M %d.%m.%Y')}</b>\n"
+                f"⏱️ Длительность: <b>{duration} часа(ов)</b>\n\n"
+                "Выберите роль, за которую хотите проголосовать:"
+            ),
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+        await bot.pin_chat_message(chat_id=adm_chat_id, message_id=voting_message.message_id)
+
+        conn = sqlite3.connect(config.db)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE voting_sessions SET status = ?, message_id = ? WHERE id = ?',
+                       ('active', voting_message.message_id, session_id))
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        logger.error(f"Не удалось отправить или закрепить сообщение: {e}")        
+
+
+async def end_voting_task(session_id: int, bot):
+    conn = sqlite3.connect(config.db)
+    cursor = conn.cursor()
+    cursor.execute('SELECT end_time, message_id FROM voting_sessions WHERE id = ?', (session_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        logger.error("Сессия голосования не найдена при завершении")
+        conn.close()
+        return
+
+    end_time_str, pinned_msg_id = row
+    end_dt = datetime.fromisoformat(end_time_str)
+    conn.close()
+
+    delay = (end_dt - get_msk_now()).total_seconds()
+    await asyncio.sleep(max(0, delay))
+
+    # Открепление сообщения
+    if pinned_msg_id:
+        try:
+            await bot.unpin_chat_message(chat_id=adm_chat_id, message_id=pinned_msg_id)
+        except Exception as e:
+            logger.warning(f"Не удалось открепить сообщение: {e}")
+
+    # Обновление статуса
+    conn = sqlite3.connect(config.db)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE voting_sessions SET status = ? WHERE id = ?', ('finished', session_id))
+    conn.commit()
+    conn.close()
+
+    # Уведомление
+    await bot.send_message(
+        chat_id=adm_chat_id,
+        text="🏁 <b>Голосование завершено!</b>",
+        parse_mode="HTML"
+    )
+
+    # Вызов подсчёта результатов
+    await display_results(session_id)
+
+
 @router_adm.message(Command('get'))
 async def cmd_create_voting(message: types.Message):
     logger.info(f"Получена команда /get от пользователя {message.from_user.id}")
@@ -187,199 +362,48 @@ async def cmd_create_voting(message: types.Message):
             await message.answer("Используйте: /get <время> <длительность в часах>")
             return
 
-        target_time_str = args[0]  # например, "11:00"
+        target_time_str = args[0]
         duration_hours = int(args[1])
 
-        # Вычисляем дату и время начала голосования
-        now = datetime.now()
-        hour, minute = map(int, target_time_str.split(':')[:2]) if ':' in target_time_str else (int(target_time_str), 0)
-
-        start_datetime = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if start_datetime <= now:
-            start_datetime += timedelta(days=1)
-
-        end_datetime = start_datetime + timedelta(hours=duration_hours)
-
-        # Получаем список админов
-        conn = sqlite3.connect(config.db)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, role_name FROM admins WHERE chat_id = ?', (adm_chat_id,))
-        admins = cursor.fetchall()
-        conn.close()
-
-        if not admins:
-            await message.answer("Нет администраторов для голосования.")
+        # Валидация времени
+        start_datetime, end_datetime = await validate_and_calculate_times(target_time_str, duration_hours)
+        if not start_datetime:
+            await message.answer("❌ Укажите время в формате ЧЧ:ММ, например 11:00.")
             return
 
-        # Иерархия ролей
-        role_hierarchy = [
-            "Око Совета",
-            "Клинок Совета",
-            "Дозор Совета",
-            "Тень Совета"
-        ]
-
-        # Правила повышения
-        promotion_path = {
-            "Око Совета": "Клинок Совета",
-            "Клинок Совета": "Дозор Совета",
-            "Дозор Совета": "Тень Совета"
-        }
-
-        admin_roles = {user_id: role for user_id, role in admins}
-        roles_config = {}
-
-        # Заполняем кандидатов для повышаемых ролей
-        for target_role, required_role in promotion_path.items():
-            candidates = [
-                uid for uid, current_role in admin_roles.items()
-                if current_role == required_role
-            ]
-            roles_config[target_role] = candidates
-
-        # Премия — все могут быть кандидатами
-        all_admin_ids = [uid for uid, _ in admins]
-        roles_config["Премия"] = all_admin_ids
-
-        # Исключаем роли без кандидатов
-        available_roles = {role: candidates for role, candidates in roles_config.items() if candidates}
-
-        if not available_roles:
+        # Получение админов и конфигурации ролей
+        roles_config = await build_roles_configuration(adm_chat_id)
+        if not roles_config:
             await message.answer("Нет подходящих кандидатов для голосования.")
             return
 
-        conn = sqlite3.connect(config.db)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO voting_sessions 
-            (session_type, target_date, duration_hours, start_time, end_time, status, roles_config)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            "role_assignment",
-            target_time_str,
-            duration_hours,
-            start_datetime,
-            end_datetime,
-            "pending",  
-            json.dumps(available_roles)
-        ))
-        session_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        # Создание сессии в БД
+        session_id = await create_voting_session(
+            target_time=target_time_str,
+            duration=duration_hours,
+            start_dt=start_datetime,
+            end_dt=end_datetime,
+            roles_config=roles_config
+        )
+        if not session_id:
+            await message.answer("❌ Не удалось создать сессию голосования.")
+            return
 
         await message.answer(f"Сессия голосования запланирована. ID: <code>{session_id}</code>", parse_mode="HTML")
 
-        voting_message_id = None
-
-        # начало голосования
-        async def start_voting_task():
-            nonlocal voting_message_id
-            time_to_wait = (start_datetime - datetime.now()).total_seconds()
-            await asyncio.sleep(max(0, time_to_wait))
-
-            # Переподключаемся к БД
-            conn = sqlite3.connect(config.db)
-            cursor = conn.cursor()
-            cursor.execute('SELECT roles_config FROM voting_sessions WHERE id = ?', (session_id,))
-            row = cursor.fetchone()
-            conn.close()
-
-            if not row:
-                logger.error("Сессия голосования не найдена при старте")
-                return
-
-            roles_config = json.loads(row[0])
-
-            # Создаём клавиатуру
-            keyboard_builder = InlineKeyboardBuilder()
-            for role_name in roles_config.keys():
-                callback_data = f"select_role_{role_name.replace(' ', '_')}"
-                keyboard_builder.button(
-                    text=f"Голосовать за {role_name}",
-                    callback_data=callback_data
-                )
-            keyboard_builder.adjust(1)
-            keyboard = keyboard_builder.as_markup()
-
-            # Отправляем сообщение
-            try:
-                voting_message = await message.bot.send_message(
-                    chat_id=message.chat.id,
-                    text=(
-                        f"✅ <b>Голосование началось!</b>\n\n"
-                        f"🕒 Начало: <b>{start_datetime.strftime('%H:%M %d.%m.%Y')}</b>\n"
-                        f"🔚 Завершение: <b>{end_datetime.strftime('%H:%M %d.%m.%Y')}</b>\n"
-                        f"⏱️ Длительность: <b>{duration_hours} часа(ов)</b>\n\n"
-                        "Выберите роль, за которую хотите проголосовать:"
-                    ),
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
-
-                # Закрепляем сообщение
-                await message.bot.pin_chat_message(chat_id=message.chat.id, message_id=voting_message.message_id)
-
-                # Обновляем статус
-                conn = sqlite3.connect(config.db)
-                cursor = conn.cursor()
-                cursor.execute('UPDATE voting_sessions SET status = ? WHERE id = ?', ('active', session_id))
-                conn.commit()
-                conn.close()
-
-                # Сохраняем ID в память
-                voting_message_id = voting_message.message_id
-
-            except Exception as e:
-                logger.error(f"Не удалось отправить или закрепить сообщение: {e}")
-
-        # Завершение голосования
-        async def end_voting_task():
-            time_to_wait = (end_datetime - datetime.now()).total_seconds()
-            await asyncio.sleep(max(0, time_to_wait))
-
-            # Обновляем статус
-            conn = sqlite3.connect(config.db)
-            cursor = conn.cursor()
-            cursor.execute('UPDATE voting_sessions SET status = ? WHERE id = ?', ('finished', session_id))
-            conn.commit()
-            conn.close()
-
-            # Открепляем сообщение, если оно есть
-            if voting_message_id:
-                try:
-                    await message.bot.unpin_chat_message(chat_id=message.chat.id, message_id=voting_message_id)
-                except Exception as e:
-                    logger.warning(f"Не удалось открепить сообщение: {e}")
-
-            # Уведомление о завершении
-            await message.bot.send_message(
-                chat_id=message.chat.id,
-                text="🏁 <b>Голосование завершено!</b>",
-                parse_mode="HTML"
-            )
-            # Вызов подсчёта результатов
-            await display_results(session_id)
-
-        # Запускаем задачи
-        asyncio.create_task(start_voting_task())
-        asyncio.create_task(end_voting_task())
+        # Запуск фоновых задач
+        asyncio.create_task(start_voting_task(session_id, message.bot))
+        asyncio.create_task(end_voting_task(session_id, message.bot))
 
     except Exception as e:
         logger.error(f"Ошибка при создании голосования: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
 
-
+    
 # Заглушка для функции display_results
 async def display_results(session_id: int):
-    try:
-        conn = sqlite3.connect(config.db)
-        cursor = conn.cursor()
-        cursor.execute('SELECT vote_data FROM votes WHERE session_id = ?', (session_id,))
-        votes = cursor.fetchall()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка при отображении результатов: {e}")
-        
+    return 
+
         
 # Команда для удаления голосования
 @router_adm.message(Command('del_voting'))

@@ -27,10 +27,12 @@ def init_db():
                 start_time TIMESTAMP,
                 end_time TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'active',
-                roles_config TEXT -- JSON строка с конфигурацией ролей
+                status TEXT DEFAULT 'pending',
+                roles_config TEXT,             
+                message_id INTEGER
             )
         ''')
+        
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS votes (
