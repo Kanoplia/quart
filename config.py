@@ -12,6 +12,7 @@ class BotConfig:
     commands: list[str]
     adm_chat_id: int
     db: str
+    promotion_path : dict
 
 config = BotConfig(
     token="8391779709:AAGiKML1NEVLD-MuSBXsCRj5szW9DwxsXbo", 
@@ -21,7 +22,12 @@ config = BotConfig(
     support_chat_id = -1003567400108,
     commands=['обратная связь','жалоба','обжалование','правила','идеи и предложения'],
     adm_chat_id= -1003567400108,
-    db= 'my_database.db'
+    db= 'my_database.db',
+    promotion_path = {
+        "Око Совета": "Клинок Совета",
+        "Клинок Совета": "Дозор Совета",
+        "Дозор Совета": "Тень Совета"
+    }
     )
 
 BOT_TOKEN = config.token

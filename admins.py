@@ -10,6 +10,7 @@ import asyncio
 import json
 import pytz
 import re
+from aiogram.fsm.context import FSMContext
 
 
 # Настройка логирования
@@ -36,6 +37,7 @@ async def get_username_by_id(user_id: int) -> str:
     except Exception:
         return f"ID: {user_id}"
     
+
 async def display_results(session_id: int):
     conn = sqlite3.connect(config.db)
     cursor = conn.cursor()
@@ -52,24 +54,24 @@ async def display_results(session_id: int):
 
         # Получаем все голоса
         cursor.execute('''
-            SELECT role_type, candidate_id, COUNT(*) as votes 
+            SELECT voter_role, candidate_id, COUNT(*) as votes 
             FROM votes 
             WHERE session_id = ? 
-            GROUP BY role_type, candidate_id
+            GROUP BY voter_role, candidate_id
         ''', (session_id,))
         raw_results = cursor.fetchall()
 
         # Группируем голоса по ролям
         results_by_role = {}
-        for role_type, cand_id, vote_count in raw_results:
-            if role_type not in results_by_role:
-                results_by_role[role_type] = []
-            results_by_role[role_type].append((cand_id, vote_count))
+        for voter_role, cand_id, vote_count in raw_results:
+            if voter_role not in results_by_role:
+                results_by_role[voter_role] = []
+            results_by_role[voter_role].append((cand_id, vote_count))
 
         # Формируем сообщение
         message_lines = ["📊 Результаты голосования:\n"]
 
-        for role_name in roles_config.keys():  # Используем роли, которые были в голосовании
+        for role_name, candidates_list in roles_config.items():
             if role_name not in results_by_role:
                 message_lines.append(f"🔹 {role_name}: нет голосов")
                 continue
@@ -78,15 +80,35 @@ async def display_results(session_id: int):
             # Сортируем по количеству голосов (по убыванию)
             votes.sort(key=lambda x: x[1], reverse=True)
 
+            total_votes_for_role = sum(vote_count for _, vote_count in votes)
             winner_id, max_votes = votes[0]
-            if winner_id is None:
-                winner_text = "❌ Никто (голосовали против всех)"
+
+            # Подсчет голосов "против всех"
+            against_all_votes = total_votes_for_role - max_votes if len(candidates_list) > 0 else max_votes
+
+            if winner_id is None or (len(candidates_list) > 0 and max_votes <= against_all_votes):
+                winner_text = "❌ Никто не выбран (голосовали против всех)"
+                winner_line = f"   Победитель: {winner_text}"
             else:
                 username = await get_username_by_id(winner_id)
-                winner_text = f"👑 {username}"
+                winner_percentage = (max_votes / total_votes_for_role * 100) if total_votes_for_role > 0 else 0
+                winner_text = f"👑 {username} ({max_votes} голосов)"
+                winner_line = f"   Победитель: {winner_text} — {winner_percentage:.1f}% от общего числа голосов"
 
             message_lines.append(f"🔹 {role_name}:")
-            message_lines.append(f"   Победитель: {winner_text} ({max_votes} голосов)")
+            message_lines.append(winner_line)
+            
+            # Добавляем информацию о распределении голосов
+            message_lines.append("   Распределение голосов:")
+            for candidate_id, count in votes:
+                if candidate_id is not None:
+                    username = await get_username_by_id(candidate_id)
+                    percentage = (count / total_votes_for_role * 100) if total_votes_for_role > 0 else 0
+                    message_lines.append(f"     • {username}: {count} голосов ({percentage:.1f}%)")
+            
+            if against_all_votes > 0:
+                message_lines.append(f"     • Против всех: {against_all_votes} голосов ({(against_all_votes/total_votes_for_role*100):.1f}%)")
+                
             message_lines.append("")
 
         await bot.send_message(adm_chat_id, "\n".join(message_lines))
@@ -96,7 +118,7 @@ async def display_results(session_id: int):
         await bot.send_message(adm_chat_id, "❌ Ошибка при подсчёте результатов.")
     finally:
         conn.close()
-    
+
     
 # Функция для получения всех админов из чата и сохранения в базу
 async def save_all_current_admins(chat_id):
@@ -113,11 +135,7 @@ async def save_all_current_admins(chat_id):
         
         for admin in administrators:
             user_id = admin.user.id
-            # Для владельца чата устанавливаем соответствующую роль
-            if admin.status == 'creator':
-                role_name = "Creator"
-            else:
-                role_name = admin.custom_title or admin.status.title()  # "Administrator"
+            role_name = admin.custom_title or admin.status.title() 
             
             # Добавляем в базу данных
             cursor.execute('''
@@ -200,12 +218,7 @@ async def build_roles_configuration(chat_id: int):
     if not admins:
         return {}
 
-    role_hierarchy = ["Око Совета", "Клинок Совета", "Дозор Совета", "Тень Совета"]
-    promotion_path = {
-        "Око Совета": "Клинок Совета",
-        "Клинок Совета": "Дозор Совета",
-        "Дозор Совета": "Тень Совета"
-    }
+    promotion_path = config.promotion_path
 
     admin_roles = {uid: role for uid, role in admins}
     roles_config = {}
@@ -214,8 +227,6 @@ async def build_roles_configuration(chat_id: int):
         candidates = [uid for uid, current_role in admin_roles.items() if current_role == required_role]
         roles_config[target_role] = candidates
 
-    all_admin_ids = [uid for uid, _ in admins]
-    roles_config["Премия"] = all_admin_ids
 
     return {role: candidates for role, candidates in roles_config.items() if candidates}
 
@@ -348,6 +359,16 @@ async def end_voting_task(session_id: int, bot):
     await display_results(session_id)
 
 
+def get_active_session_by_date():
+    with sqlite3.connect(config.db) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM voting_sessions WHERE  status = 'active'
+        """)
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
 @router_adm.message(Command('get'))
 async def cmd_create_voting(message: types.Message):
     logger.info(f"Получена команда /get от пользователя {message.from_user.id}")
@@ -428,12 +449,7 @@ async def handle_select_role_callback(callback: CallbackQuery):
         await callback.answer("Неверные данные.")
         return
 
-    promotion_path = {
-        "Око Совета": "Клинок Совета",
-        "Клинок Совета": "Дозор Совета",
-        "Дозор Совета": "Тень Совета",
-        "Премия": "Премия"
-    }
+    promotion_path = config.promotion_path
 
     role_key = parts[2].replace('_', ' ')
     if role_key not in promotion_path:
@@ -522,6 +538,83 @@ async def handle_select_role_callback(callback: CallbackQuery):
     finally:
         if conn:
             conn.close()
+            
+                 
+@router_adm.callback_query(F.data.startswith("admin_profile_"))
+async def handle_select_admin_callback(callback: CallbackQuery):
+    now = str(datetime.now(pytz.timezone('Europe/Moscow')))
+    try:
+        candidate_id = int(callback.data.split("_")[-1])
+    except (IndexError, ValueError):
+        await callback.answer("❌ Некорректный ID кандидата.")
+        return
+
+    voter_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    
+    session_id = get_active_session_by_date()
+    if not session_id:
+        await callback.answer("🚫 Сессия голосования не найдена.", show_alert=True)
+        return
+
+    with sqlite3.connect(config.db) as conn:
+        cursor = conn.cursor()
+
+        # Получаем информацию о сессии
+        cursor.execute("""
+            SELECT start_time, end_time, status FROM voting_sessions WHERE id = ?
+        """, (session_id,))
+        row = cursor.fetchone()
+        if not row:
+            await callback.answer("❌ Сессия не найдена.", show_alert=True)
+            return
+
+        start_time_str, end_time_str, status = row
+
+        if status != "active":
+            await callback.answer("❌ Голосование не активно.", show_alert=True)
+            return
+        if now < start_time_str or now > end_time_str:
+            await callback.answer("⏰ Время голосования истекло.", show_alert=True)
+            return
+
+
+        cursor.execute("""
+            SELECT role_name FROM admins WHERE user_id = ? AND chat_id = ?
+        """, (voter_id, chat_id))
+        admin_role_row = cursor.fetchone()
+        if not admin_role_row:
+            await callback.answer("🚫 Доступ запрещён: вы не являетесь админом.", show_alert=True)
+            return
+        voter_role = admin_role_row[0]
+
+        cursor.execute("""
+            SELECT role_name FROM admins WHERE user_id = ?
+        """, (candidate_id,))
+        candidate_row = cursor.fetchone()
+        if not candidate_row:
+            await callback.answer("❌ Кандидат не найден.", show_alert=True)
+            return
+        candidate_role = candidate_row[0]
+
+        # Проверяем, не голосовал ли уже этот админ за этого кандидата
+        cursor.execute("""
+            SELECT 1 FROM votes 
+            WHERE session_id = ? AND voter_id = ? AND candidate_id = ?
+        """, (session_id, voter_id, candidate_id))
+        if cursor.fetchone():
+            await callback.answer("⚠️ Вы уже голосовали за этого кандидата.", show_alert=True)
+            return
+
+        # Записываем голос
+        cursor.execute("""
+            INSERT INTO votes (session_id, voter_id, voter_role, candidate_id)
+            VALUES (?, ?, ?, ?)
+        """, (session_id, voter_id, voter_role, candidate_id))
+        conn.commit()
+
+    await callback.answer("✅ Ваш голос засчитан!", show_alert=True)
+            
 
 @router_adm.callback_query(F.data == "show_admin_roles")
 async def show_voting_roles(callback: CallbackQuery):

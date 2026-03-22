@@ -40,6 +40,7 @@ def init_db():
                 session_id INTEGER,
                 voter_id INTEGER,
                 voter_role TEXT,
+                candidate_id INTEGER,
                 FOREIGN KEY (session_id) REFERENCES voting_sessions (id)
             )
         ''')
