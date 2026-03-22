@@ -43,15 +43,6 @@ async def display_results(session_id: int):
     cursor = conn.cursor()
 
     try:
-        # Получаем конфигурацию ролей
-        cursor.execute('SELECT roles_config FROM voting_sessions WHERE id = ?', (session_id,))
-        config_row = cursor.fetchone()
-        if not config_row or not config_row[0]:
-            await bot.send_message(adm_chat_id, "Не удалось загрузить конфигурацию голосования.")
-            return
-
-        roles_config = json.loads(config_row[0])
-
         # Получаем все голоса
         cursor.execute('''
             SELECT voter_role, candidate_id, COUNT(*) as votes 
@@ -71,45 +62,18 @@ async def display_results(session_id: int):
         # Формируем сообщение
         message_lines = ["📊 Результаты голосования:\n"]
 
-        for role_name, candidates_list in roles_config.items():
-            if role_name not in results_by_role:
-                message_lines.append(f"🔹 {role_name}: нет голосов")
-                continue
-
-            votes = results_by_role[role_name]
+        for role_name, votes in results_by_role.items():
             # Сортируем по количеству голосов (по убыванию)
             votes.sort(key=lambda x: x[1], reverse=True)
 
             total_votes_for_role = sum(vote_count for _, vote_count in votes)
             winner_id, max_votes = votes[0]
 
-            # Подсчет голосов "против всех"
-            against_all_votes = total_votes_for_role - max_votes if len(candidates_list) > 0 else max_votes
+            winner_percentage = (max_votes / total_votes_for_role * 100) if total_votes_for_role > 0 else 0
+            username = await get_username_by_id(winner_id)
+            winner_text = f"👑 {username} ({max_votes} голосов) — {winner_percentage:.1f}%"
 
-            if winner_id is None or (len(candidates_list) > 0 and max_votes <= against_all_votes):
-                winner_text = "❌ Никто не выбран (голосовали против всех)"
-                winner_line = f"   Победитель: {winner_text}"
-            else:
-                username = await get_username_by_id(winner_id)
-                winner_percentage = (max_votes / total_votes_for_role * 100) if total_votes_for_role > 0 else 0
-                winner_text = f"👑 {username} ({max_votes} голосов)"
-                winner_line = f"   Победитель: {winner_text} — {winner_percentage:.1f}% от общего числа голосов"
-
-            message_lines.append(f"🔹 {role_name}:")
-            message_lines.append(winner_line)
-            
-            # Добавляем информацию о распределении голосов
-            message_lines.append("   Распределение голосов:")
-            for candidate_id, count in votes:
-                if candidate_id is not None:
-                    username = await get_username_by_id(candidate_id)
-                    percentage = (count / total_votes_for_role * 100) if total_votes_for_role > 0 else 0
-                    message_lines.append(f"     • {username}: {count} голосов ({percentage:.1f}%)")
-            
-            if against_all_votes > 0:
-                message_lines.append(f"     • Против всех: {against_all_votes} голосов ({(against_all_votes/total_votes_for_role*100):.1f}%)")
-                
-            message_lines.append("")
+            message_lines.append(f"🔹 {role_name}: {winner_text}")
 
         await bot.send_message(adm_chat_id, "\n".join(message_lines))
 
@@ -195,7 +159,7 @@ async def cmd_admin_list(message: types.Message):
     await message.answer(response)
 
 
-async def validate_and_calculate_times(time_str: str, duration_hours: int):
+async def validate_and_calculate_times(time_str: str, duration_hours: float):
     try:
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         hour, minute = map(int, time_str.split(':'))
@@ -386,7 +350,7 @@ async def cmd_create_voting(message: types.Message):
             return
 
         target_time_str = args[0]
-        duration_hours = int(args[1])
+        duration_hours = float(args[1])
 
         # Валидация времени
         start_datetime, end_datetime = await validate_and_calculate_times(target_time_str, duration_hours)
