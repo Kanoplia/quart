@@ -596,7 +596,9 @@ async def handle_select_admin_callback(callback: CallbackQuery):
             await callback.answer("❌ Кандидат не найден.", show_alert=True)
             return
         candidate_role = candidate_row[0]
-
+        if voter_id == candidate_id:
+            await callback.answer("ну ты и шалун", show_alert=True)
+            return
         # Проверяем, не голосовал ли уже этот админ за этого кандидата
         cursor.execute("""
             SELECT 1 FROM votes 
